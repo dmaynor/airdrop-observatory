@@ -812,6 +812,8 @@ def _make_quarantine_checker(
             path = os.path.join(watch_dir, name)
             if path in seen:
                 continue
+            if os.path.islink(path):
+                continue  # skip symlinks — avoid following to arbitrary targets
             try:
                 st = os.stat(path)
             except OSError:
@@ -861,6 +863,8 @@ def _make_filetype_scanner(
             path = os.path.join(watch_dir, name)
             if path in seen:
                 continue
+            if os.path.islink(path):
+                continue  # skip symlinks
             try:
                 st = os.stat(path)
             except OSError:
@@ -1148,7 +1152,8 @@ class MonitorEngine:
             all_records.extend(self.buffers[ch].get_records())
         all_records.sort(key=lambda r: r.timestamp_epoch)
 
-        with open(path, "w", encoding="utf-8") as f:
+        fd = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             if fmt == "text":
                 f.write(
                     f"# AirDrop Observatory export — "
@@ -1325,12 +1330,15 @@ class AirDropTUI:
             self.filter_mode = False
             curses.curs_set(0)
             try:
-                self.filter_re = (
-                    re.compile(self.filter_text, re.IGNORECASE)
-                    if self.filter_text
-                    else None
-                )
-            except re.error:
+                if self.filter_text:
+                    candidate = re.compile(self.filter_text, re.IGNORECASE)
+                    # ReDoS guard: test against a moderately long string
+                    # to detect catastrophic backtracking before use
+                    candidate.search("a" * 200)
+                    self.filter_re = candidate
+                else:
+                    self.filter_re = None
+            except (re.error, RecursionError):
                 self.filter_re = None
         elif key in (curses.KEY_BACKSPACE, 127, 8):
             self.filter_text = self.filter_text[:-1]
