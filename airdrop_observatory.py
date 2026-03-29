@@ -1756,6 +1756,22 @@ def main() -> None:
             "monitor, and daemon channels (callservicesd, rapportd, studentd)"
         ),
     )
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        help=(
+            "Run without TUI — stream records to stdout (and --logfile if set). "
+            "Designed for LLM agents, CI pipelines, and background logging. "
+            "Stop with Ctrl-C or SIGTERM."
+        ),
+    )
+    parser.add_argument(
+        "--duration",
+        type=int,
+        default=0,
+        metavar="SECS",
+        help="In headless mode, run for SECS seconds then exit (0 = run forever)",
+    )
     args = parser.parse_args()
 
     file_sink: Optional[FileSink] = None
@@ -1768,16 +1784,58 @@ def main() -> None:
         file_sink=file_sink,
     )
 
-    def run_tui(stdscr: "curses.window") -> None:
-        tui = AirDropTUI(stdscr, engine, export_format=args.log_format)
+    if args.headless:
+        _run_headless(engine, args)
+    else:
+        def run_tui(stdscr: "curses.window") -> None:
+            tui = AirDropTUI(stdscr, engine, export_format=args.log_format)
+            try:
+                tui.run()
+            finally:
+                engine.shutdown()
+
         try:
-            tui.run()
-        finally:
+            curses.wrapper(run_tui)
+        except KeyboardInterrupt:
             engine.shutdown()
 
+
+def _run_headless(engine: MonitorEngine, args: argparse.Namespace) -> None:
+    """Run without TUI — stream all records to stdout."""
+    fmt = args.log_format
+    formatter = LogRecord.format_jsonl if fmt == "jsonl" else LogRecord.format_text
+    duration = args.duration
+
+    engine.start()
+    start_time = time.time()
+
     try:
-        curses.wrapper(run_tui)
+        while True:
+            # Drain all channel buffers and print new records
+            for ch in CHANNELS:
+                buf = engine.buffers.get(ch)
+                if not buf:
+                    continue
+                records = buf.get_records()
+                # Only print records we haven't seen yet
+                # (use new_count as a proxy — print last N new records)
+                new = buf.new_count
+                if new > 0:
+                    for record in records[-new:]:
+                        try:
+                            print(formatter(record), flush=True)
+                        except BrokenPipeError:
+                            engine.shutdown()
+                            return
+                    buf.mark_viewed()
+
+            if duration > 0 and (time.time() - start_time) >= duration:
+                break
+
+            time.sleep(0.25)
     except KeyboardInterrupt:
+        pass
+    finally:
         engine.shutdown()
 
 
