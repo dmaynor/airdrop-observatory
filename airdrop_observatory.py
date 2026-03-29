@@ -387,6 +387,45 @@ class PollWorker(threading.Thread):
         self._emit(Level.INFO, "stopped")
 
 
+class CallablePollWorker(threading.Thread):
+    """Periodically call a Python function and emit results as LogRecords."""
+
+    def __init__(
+        self,
+        name: str,
+        channel: str,
+        poll_seconds: float,
+        fn: Callable[[], List[Tuple[Level, str]]],
+        out_queue: "queue.Queue[LogRecord]",
+        stop_event: threading.Event,
+    ) -> None:
+        super().__init__(daemon=True, name=f"callable-{name}")
+        self.worker_name = name
+        self.channel = channel
+        self.poll_seconds = poll_seconds
+        self.fn = fn
+        self.out_queue = out_queue
+        self.stop_event = stop_event
+
+    def _emit(self, level: Level, msg: str) -> None:
+        self.out_queue.put(_make_record(level, self.channel, self.worker_name, msg))
+
+    def run(self) -> None:
+        self._emit(Level.INFO, "started")
+        while not self.stop_event.is_set():
+            try:
+                results = self.fn()
+                for level, msg in results:
+                    self._emit(level, msg)
+            except Exception as exc:
+                self._emit(Level.ERROR, f"poll fn failed: {exc!r}")
+            slept = 0.0
+            while slept < self.poll_seconds and not self.stop_event.is_set():
+                time.sleep(min(0.2, self.poll_seconds - slept))
+                slept += 0.2
+        self._emit(Level.INFO, "stopped")
+
+
 # ---------------------------------------------------------------------------
 # Channel / buffer management
 # ---------------------------------------------------------------------------
@@ -411,6 +450,14 @@ WORKER_TO_CHANNEL: Dict[str, str] = {
     "bonjour_browse": "bonjour",
     "sharingd_sockets": "sockets",
     "tcpdump_awdl0": "tcpdump",
+    # Security monitoring (activated by --security)
+    "prefs_watchdog": "security",
+    "quarantine_checker": "security",
+    "filetype_scanner": "security",
+    "net_listener_checker": "security",
+    "callservicesd_log": "callservicesd",
+    "rapportd_log": "rapportd",
+    "studentd_log": "studentd",
 }
 
 
@@ -538,6 +585,57 @@ HIGHLIGHT_RULES: List[HighlightRule] = [
         category="state",
         tooltip="State transition: interface/service activation or deactivation",
     ),
+    # -- Security monitoring: auto-accept (--security) --
+    HighlightRule(
+        pattern=re.compile(r"(?i)\b(?:AlwaysAutoAccept|auto.?accept|silent.?accept)\b"),
+        color_pair_idx=16,
+        marker="\u26a0",  # ⚠
+        category="auto-accept",
+        tooltip="DANGER: AirDrop auto-accept — files delivered without user prompt",
+    ),
+    # -- Security monitoring: quarantine bypass --
+    HighlightRule(
+        pattern=re.compile(
+            r"(?i)\b(?:DisableQuarantine|quarantine.?(?:skip|bypass)|MISSING QUARANTINE)\b"
+        ),
+        color_pair_idx=16,
+        marker="\u26a0",  # ⚠
+        category="quarantine-skip",
+        tooltip="DANGER: Gatekeeper quarantine disabled or missing on received file",
+    ),
+    # -- Security monitoring: encryption disable --
+    HighlightRule(
+        pattern=re.compile(
+            r"(?i)\b(?:DisableEncryption|DisableContinuityTLS"
+            r"|disableFaceTimeKeyExchange|encryption.?(?:off|disable))\b"
+        ),
+        color_pair_idx=16,
+        marker="\u26a0",  # ⚠
+        category="encryption-disable",
+        tooltip="DANGER: Transport encryption disabled — traffic vulnerable to interception",
+    ),
+    # -- Security monitoring: debug/test mode --
+    HighlightRule(
+        pattern=re.compile(
+            r"(?i)\b(?:EnableDebugMode|AUTestModePassword"
+            r"|allowHTTPSplunkServerForTests|DebugMode|TestMode)\b"
+        ),
+        color_pair_idx=17,
+        marker="\u2691",  # ⚑
+        category="debug-mode",
+        tooltip="WARNING: Debug/test mode active — security checks may be weakened",
+    ),
+    # -- Security monitoring: auth bypass / injection --
+    HighlightRule(
+        pattern=re.compile(
+            r"(?i)\b(?:allowUnauthenticated|BypassAuthentication"
+            r"|forceUnpromptedRemote|INJECTED|DisableBlastdoor)\b"
+        ),
+        color_pair_idx=16,
+        marker="\u26a0",  # ⚠
+        category="auth-bypass",
+        tooltip="DANGER: Authentication or authorization bypass detected",
+    ),
 ]
 
 
@@ -571,6 +669,253 @@ def compute_highlights(
 
 
 # ---------------------------------------------------------------------------
+# Security monitoring: preference watchdog + quarantine + file scanner + net
+# ---------------------------------------------------------------------------
+
+_MISSING = object()
+
+DANGEROUS_PREFS: Dict[str, List[str]] = {
+    "com.apple.sharing": [
+        "AlwaysAutoAccept", "DisableQuarantine", "DisableContinuityTLS",
+        "AUTestModePassword", "EnableDebugMode", "DisableEncryption",
+        "pretendDeviceWaitingForGuestModeApproval", "pretendNotUnlockedRecently",
+    ],
+    "com.apple.TelephonyUtilities": [
+        "disableFaceTimeKeyExchange", "DisableBlastdoorValidationPrompt",
+        "disable-receptionist-disclosure-checks", "allowOutgoingCallsWhenLocked",
+    ],
+    "com.apple.classroom": [
+        "forceUnpromptedRemoteScreenObservation",
+        "allowClassroomLockDevice",
+        "allowClassroomOpenApp",
+        "allowClassroomOpenURL",
+    ],
+    "com.apple.rapport": ["allowUnauthenticated", "ForceL2CAP"],
+    "com.apple.securityuploadd": [
+        "allowInsecureSplunkCert", "allowHTTPSplunkServerForTests", "disableUploads",
+    ],
+    "com.apple.intelligenceflow": [
+        "agenticPlannerZincUrl", "disableToolBoxAllowList",
+    ],
+    "com.apple.gamed": ["BypassAuthentication"],
+}
+
+# Classroom keys have per-device suffixes — need prefix matching
+_CLASSROOM_PREFIX_KEYS = [
+    "forceUnpromptedRemoteScreenObservation",
+    "allowClassroomLockDevice",
+    "allowClassroomOpenApp",
+    "allowClassroomOpenURL",
+]
+
+
+def _make_prefs_checker() -> Callable[[], List[Tuple[Level, str]]]:
+    """Factory returning a stateful preference watchdog callable."""
+    baseline: Dict[Tuple[str, str], Any] = {}
+    first_run = True
+
+    def _read_key(domain: str, key: str) -> Any:
+        try:
+            res = subprocess.run(
+                ["defaults", "read", domain, key],
+                capture_output=True, text=True, timeout=2,
+            )
+            return res.stdout.strip() if res.returncode == 0 else _MISSING
+        except Exception:
+            return _MISSING
+
+    def _read_classroom_prefixes() -> Dict[Tuple[str, str], str]:
+        """Read com.apple.classroom and match prefix keys."""
+        found: Dict[Tuple[str, str], str] = {}
+        try:
+            res = subprocess.run(
+                ["defaults", "read", "com.apple.classroom"],
+                capture_output=True, text=True, timeout=3,
+            )
+            if res.returncode != 0:
+                return found
+            for line in res.stdout.splitlines():
+                line = line.strip().strip(";").strip('"')
+                for prefix in _CLASSROOM_PREFIX_KEYS:
+                    if line.startswith(prefix) and "=" in line:
+                        key = line.split("=")[0].strip().strip('"')
+                        val = line.split("=", 1)[1].strip().strip(";").strip()
+                        found[("com.apple.classroom", key)] = val
+        except Exception:
+            pass
+        return found
+
+    def check() -> List[Tuple[Level, str]]:
+        nonlocal baseline, first_run
+        results: List[Tuple[Level, str]] = []
+        current: Dict[Tuple[str, str], Any] = {}
+
+        for domain, keys in DANGEROUS_PREFS.items():
+            if domain == "com.apple.classroom":
+                current.update(_read_classroom_prefixes())
+            else:
+                for key in keys:
+                    current[(domain, key)] = _read_key(domain, key)
+
+        if first_run:
+            for (domain, key), val in current.items():
+                if val is not _MISSING:
+                    results.append((
+                        Level.WARN,
+                        f"[PREFS] EXISTING: {domain} {key} = {val}",
+                    ))
+            if not results:
+                results.append((Level.INFO, "[PREFS] baseline clean — no dangerous keys set"))
+            baseline = dict(current)
+            first_run = False
+        else:
+            for dk, val in current.items():
+                old = baseline.get(dk, _MISSING)
+                if val != old:
+                    domain, key = dk
+                    if val is not _MISSING and old is _MISSING:
+                        results.append((
+                            Level.ERROR,
+                            f"[PREFS] INJECTED: {domain} {key} = {val}",
+                        ))
+                    elif val is _MISSING and old is not _MISSING:
+                        results.append((
+                            Level.WARN,
+                            f"[PREFS] REMOVED: {domain} {key} (was {old})",
+                        ))
+                    else:
+                        results.append((
+                            Level.ERROR,
+                            f"[PREFS] CHANGED: {domain} {key}: {old} -> {val}",
+                        ))
+            baseline = dict(current)
+        return results
+
+    return check
+
+
+def _make_quarantine_checker(
+    watch_dir: Optional[str] = None,
+) -> Callable[[], List[Tuple[Level, str]]]:
+    """Factory for quarantine xattr verification on new Downloads."""
+    watch_dir = watch_dir or os.path.expanduser("~/Downloads")
+    seen: set = set()
+
+    def check() -> List[Tuple[Level, str]]:
+        results: List[Tuple[Level, str]] = []
+        now = time.time()
+        try:
+            entries = os.listdir(watch_dir)
+        except OSError:
+            return [(Level.WARN, "[QUAR] cannot read ~/Downloads")]
+        for name in entries:
+            path = os.path.join(watch_dir, name)
+            if path in seen:
+                continue
+            try:
+                st = os.stat(path)
+            except OSError:
+                continue
+            if now - st.st_mtime > 60:
+                continue
+            seen.add(path)
+            res = subprocess.run(
+                ["xattr", "-p", "com.apple.quarantine", path],
+                capture_output=True, text=True, timeout=2,
+            )
+            if res.returncode != 0:
+                results.append((
+                    Level.ERROR,
+                    f"[QUAR] MISSING QUARANTINE: {name} — Gatekeeper bypass!",
+                ))
+            else:
+                results.append((
+                    Level.INFO, f"[QUAR] OK: {name} has quarantine xattr",
+                ))
+        return results
+
+    return check
+
+
+_DANGEROUS_EXTENSIONS = frozenset({
+    ".app", ".ipa", ".mobileconfig", ".command", ".pkg",
+    ".dmg", ".scpt", ".workflow", ".action",
+})
+
+
+def _make_filetype_scanner(
+    watch_dir: Optional[str] = None,
+) -> Callable[[], List[Tuple[Level, str]]]:
+    """Factory for dangerous file type detection in Downloads."""
+    watch_dir = watch_dir or os.path.expanduser("~/Downloads")
+    seen: set = set()
+
+    def check() -> List[Tuple[Level, str]]:
+        results: List[Tuple[Level, str]] = []
+        now = time.time()
+        try:
+            entries = os.listdir(watch_dir)
+        except OSError:
+            return []
+        for name in entries:
+            path = os.path.join(watch_dir, name)
+            if path in seen:
+                continue
+            try:
+                st = os.stat(path)
+            except OSError:
+                continue
+            if now - st.st_mtime > 120:
+                continue
+            seen.add(path)
+            _, ext = os.path.splitext(name.lower())
+            if ext in _DANGEROUS_EXTENSIONS:
+                results.append((
+                    Level.ERROR,
+                    f"[FILE] DANGEROUS TYPE: {name} ({ext}) in ~/Downloads",
+                ))
+        return results
+
+    return check
+
+
+def _make_net_listener_checker() -> Callable[[], List[Tuple[Level, str]]]:
+    """Factory for network listener baseline-and-diff monitoring."""
+    baseline_ports: set = set()
+    first_run = True
+
+    def check() -> List[Tuple[Level, str]]:
+        nonlocal baseline_ports, first_run
+        results: List[Tuple[Level, str]] = []
+        current: set = set()
+        try:
+            res = subprocess.run(
+                ["lsof", "-iTCP", "-sTCP:LISTEN", "-n", "-P"],
+                capture_output=True, text=True, timeout=5,
+            )
+            for line in res.stdout.strip().split("\n")[1:]:
+                parts = line.split()
+                if len(parts) >= 9:
+                    current.add((parts[0], parts[8]))
+        except Exception:
+            return [(Level.WARN, "[NET] failed to check listeners")]
+
+        if first_run:
+            baseline_ports = current
+            results.append((Level.INFO, f"[NET] baseline: {len(current)} listeners"))
+            first_run = False
+        else:
+            for proc, addr in current - baseline_ports:
+                results.append((Level.WARN, f"[NET] NEW LISTENER: {proc} on {addr}"))
+            for proc, addr in baseline_ports - current:
+                results.append((Level.INFO, f"[NET] listener closed: {proc} on {addr}"))
+            baseline_ports = current
+        return results
+
+    return check
+
+
+# ---------------------------------------------------------------------------
 # Monitor engine
 # ---------------------------------------------------------------------------
 
@@ -580,15 +925,23 @@ class MonitorEngine:
     def __init__(
         self,
         enable_tcpdump: bool = False,
+        enable_security: bool = False,
         file_sink: Optional[FileSink] = None,
     ) -> None:
         self.enable_tcpdump = enable_tcpdump
+        self._enable_security = enable_security
         self._file_sink = file_sink
         self._out_queue: "queue.Queue[LogRecord]" = queue.Queue()
         self._stop_event = threading.Event()
         self._workers: List[threading.Thread] = []
         self._drain_thread: Optional[threading.Thread] = None
         self.running = False
+
+        # Extend channels for security mode
+        if self._enable_security:
+            for ch in ("security", "callservicesd", "rapportd", "studentd"):
+                if ch not in CHANNELS:
+                    CHANNELS.append(ch)
 
         self.buffers: Dict[str, ChannelBuffer] = {
             ch: ChannelBuffer() for ch in CHANNELS
@@ -673,6 +1026,26 @@ class MonitorEngine:
                 "tcpdump disabled (use --tcpdump and run as root)",
             )
 
+        # Security monitoring workers
+        if self._enable_security:
+            for proc in ("callservicesd", "rapportd", "studentd"):
+                specs.append(ProcSpec(
+                    name=f"{proc}_log",
+                    argv=[
+                        "log", "stream", "--style", "compact",
+                        "--predicate", f'process == "{proc}"', "--info",
+                    ],
+                    coalesce=True,
+                ))
+            self.inject(Level.INFO, "security", "security monitoring enabled")
+        else:
+            for ch in ("security", "callservicesd", "rapportd", "studentd"):
+                if ch in self.buffers:
+                    self.inject(
+                        Level.INFO, ch,
+                        "disabled (use --security to enable)",
+                    )
+
         self._workers = []
 
         for spec in specs:
@@ -698,6 +1071,23 @@ class MonitorEngine:
             )
             self._workers.append(p)
             p.start()
+
+        # Security callable poll workers
+        if self._enable_security:
+            security_polls: List[Tuple[str, float, Callable]] = [
+                ("prefs_watchdog", 2.0, _make_prefs_checker()),
+                ("quarantine_checker", 3.0, _make_quarantine_checker()),
+                ("filetype_scanner", 5.0, _make_filetype_scanner()),
+                ("net_listener_checker", 5.0, _make_net_listener_checker()),
+            ]
+            for name, secs, fn in security_polls:
+                channel = WORKER_TO_CHANNEL[name]
+                w = CallablePollWorker(
+                    name=name, channel=channel, poll_seconds=secs, fn=fn,
+                    out_queue=self._out_queue, stop_event=self._stop_event,
+                )
+                self._workers.append(w)
+                w.start()
 
         self._drain_thread = threading.Thread(
             target=self._drain_loop, daemon=True
@@ -825,6 +1215,9 @@ class AirDropTUI:
         curses.init_pair(12, curses.COLOR_CYAN, -1)       # AWDL/radio
         curses.init_pair(13, curses.COLOR_RED, -1)        # security
         curses.init_pair(14, curses.COLOR_YELLOW, -1)     # state change
+        # Security alert pairs (16-17)
+        curses.init_pair(16, curses.COLOR_RED, curses.COLOR_YELLOW)     # critical
+        curses.init_pair(17, curses.COLOR_BLACK, curses.COLOR_MAGENTA)  # debug/test
         # Tooltip box
         curses.init_pair(15, curses.COLOR_WHITE, curses.COLOR_BLUE)
 
@@ -1277,6 +1670,8 @@ class AirDropTUI:
             "\u2551  \u2637  awdl       (radio/channel/p2p)         \u2551",
             "\u2551  \u26bf  security   (cert/TLS/identity)         \u2551",
             "\u2551  \u25cf  state      (activate/enable/up/down)   \u2551",
+            "\u2551  \u26a0  alert      (security: inject/bypass)    \u2551",
+            "\u2551  \u2691  debug      (debug/test mode active)     \u2551",
             "\u2551                                              \u2551",
             "\u2551  Hover or click a highlighted keyword for    \u2551",
             "\u2551  a tooltip explaining its significance.      \u2551",
@@ -1352,6 +1747,15 @@ def main() -> None:
         default="text",
         help="Format for --logfile and 'e' exports (default: text)",
     )
+    parser.add_argument(
+        "--security",
+        action="store_true",
+        help=(
+            "Enable security monitoring: preference injection watchdog, "
+            "quarantine verification, file type scanner, network listener "
+            "monitor, and daemon channels (callservicesd, rapportd, studentd)"
+        ),
+    )
     args = parser.parse_args()
 
     file_sink: Optional[FileSink] = None
@@ -1360,6 +1764,7 @@ def main() -> None:
 
     engine = MonitorEngine(
         enable_tcpdump=args.tcpdump,
+        enable_security=args.security,
         file_sink=file_sink,
     )
 
